@@ -25,9 +25,10 @@ int main(int argc, char **argv) {
 
     struct addrinfo hints{}, *res;
     memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_UNSPEC;     // IPv4 or IPv6
+    hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
-    hints.ai_flags = AI_PASSIVE;     // for bind
+    hints.ai_protocol = IPPROTO_TCP; // <--- add this
+    hints.ai_flags = AI_PASSIVE;
 
     int rc = getaddrinfo(nullptr, port.c_str(), &hints, &res);
     if (rc != 0) {
