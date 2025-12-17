@@ -1,98 +1,168 @@
-# Capacity Analysis of IWR1642 Radar-Based Sensing System
+# Capacity Analysis for Multi-Radar Streaming (TI IWR1642BOOST)
 
-This project implements a small end-to-end testbed to study **capacity and delay** in a radar sensing system using **TI IWR1642BOOST** mmWave radars and a Python-based **queueing server**.
+This repo contains a **small end-to-end testbed** for studying *capacity* and *queueing delay* when multiple **TI IWR1642BOOST** radars stream detections (x,y) to a **single server**.  
+The server models an **M/M/1/K**-style system (Poisson arrivals, exponential service times, finite waiting buffer) and reports:
 
-Two radars (R1 and R2) detect objects, extract `(x, y)` coordinates from the raw frames, and send them as timestamped packets to a central server over TCP. The server models a finite-buffer queue with a given **service rate**, logs delays, marks “corrupted” samples when the delay is too high, and finally plots delay histograms for each radar.
-
----
-
-## 1. System Overview
-
-### Components
-
-- **Radar clients**
-  - `radar1.py` – client for Radar R1 :contentReference[oaicite:0]{index=0}  
-  - `radar2.py` – client for Radar R2 :contentReference[oaicite:1]{index=1}  
-  - Connect to the IWR1642 over two serial ports:
-    - CLI port – sends configuration commands (`.cfg` file)
-    - DATA port – receives binary radar frames
-  - Parse the binary stream, extract detected object positions `(x, y)`, and send them to the server as:
-    ```text
-    RADAR_ID,timestamp,x,y\n
-    ```
-
-- **Queueing server**
-  - `server.py` – central TCP server and queue simulator :contentReference[oaicite:2]{index=2}  
-  - Accepts connections from multiple radar clients.
-  - Buffers incoming `(x, y)` messages in a finite FIFO queue.
-  - Serves items at a fixed **service rate**.
-  - Logs per-packet delay and classifies samples as:
-    - **OK** – delay below threshold  
-    - **CORRUPTED** – delay above threshold (coordinates are randomly perturbed)  
-    - **LOST** – dropped when queue is full  
-
-- **Configuration files**
-  - `IWR1642_R1_SDK3_config.cfg`
-  - `IWR1642_R2_SDK3_config.cfg`  
-  These specify radar parameters such as chirp configuration, frame rate, etc. (standard TI mmWave cfg format).
-
-- **Utility**
-  - `run_all.bat` / `makefile` – helper scripts to run the server and clients (optional for your platform).
+- **End-to-end delay** per packet (client send timestamp → server processing time)
+- **“Corruption” rate** (packets whose delay exceeds a threshold; the server perturbs x,y to emulate stale/invalid data)
+- **Loss rate** (packets dropped when the server queue is full)
+- **Delay histograms** saved as PNGs per radar
 
 ---
 
-## 2. Queueing & Capacity Model
+## Repository layout
 
-The project is designed to illustrate basic queueing theory concepts:
-
-- **Arrival process**
-  - Clients send messages at a configurable **arrival rate**:
-    ```python
-    arrival_rate = 10  # packets/sec
-    ```
-  - Inter-arrival times are drawn from an **Exponential** distribution (Poisson arrivals):
-    ```python
-    wait = np.random.exponential(1 / arrival_rate)
-    ```
-
-- **Service process**
-  - The server processes items at a fixed **service rate**:
-    ```python
-    SERVICE_RATE = 40  # messages per second
-    ```
-  - The `queue_processor()` thread pops messages from the queue and sleeps for `1 / SERVICE_RATE` between services.
-
-- **Finite queue**
-  - Max length:
-    ```python
-    MAX_QUEUE_LEN = 30
-    ```
-  - If the queue is full, packets are counted as **LOST**.
-
-- **Delay & corruption**
-  - Per-packet delay = `time_processed - time_queued`.
-  - If delay exceeds a threshold (e.g. `upper_threshold = 0.09` seconds), the sample is treated as **corrupted** and `(x, y)` is perturbed by random noise.
-
-- **Capacity metrics**
-  - For each radar, after all clients disconnect, the server prints:
-    - Number of OK, CORRUPTED, and LOST packets.
-    - Error rate (% corrupted) and loss rate (% dropped).
-  - Histograms of delays are saved as:
-    - `delay_histogram_R1.png`
-    - `delay_histogram_R2.png`  
-    Example plots are shown at the top of this README.
+- `server.py` — TCP server + finite queue + service process + final summary + histogram plots
+- `radar1.py` — Radar client for **R1** (reads frames over serial, extracts x,y, sends to server with Poisson traffic)
+- `radar2.py` — Radar client for **R2**
+- `IWR1642_R1_SDK3_config.cfg`, `IWR1642_R2_SDK3_config.cfg` — mmWave configuration files (sent on the CLI port)
+- `run_all.bat` — Windows helper to start server + both radars in separate terminals
+- `makefile` — **Note:** currently references older filenames; see the Linux/macOS notes below.
 
 ---
 
-## 3. Repository Structure
+## How the system works
 
-```text
-.
-├── radar1.py                    # Radar client for R1
-├── radar2.py                    # Radar client for R2
-├── server.py                    # TCP queueing server + statistics
-├── IWR1642_R1_SDK3_config.cfg   # Radar configuration for R1
-├── IWR1642_R2_SDK3_config.cfg   # Radar configuration for R2
-├── run_all.bat                  # (Optional) Windows helper script
-├── makefile                     # (Optional) build/run helper
-└── README.md                    # This file
+### Data path (high level)
+1. **Radar (IWR1642BOOST)** streams binary frames on the **DATA** serial port (921600 baud by default).
+2. Each radar script:
+   - detects the **magic word** (`0x0201040306050807`)
+   - reads the frame header
+   - parses **TLV type 1** (detected points)
+   - extracts x,y for detections and **uses the first detection** as payload
+3. The radar script sends newline-delimited messages over TCP:
+   ```
+   RADAR_ID,unix_timestamp,x,y
+   ```
+4. The server:
+   - enqueues each message into a finite queue of length **K**
+   - drops packets if the queue is full (**lost**)
+   - a background worker processes queued packets with **exponential service time** (rate μ)
+   - computes the **end-to-end delay**
+   - marks a packet **corrupted** if delay > `upper_threshold` and perturbs x,y
+
+### Queueing model (what is being simulated)
+- **Arrivals:** each radar waits `Exp(λ)` seconds between sends (Poisson process per radar)
+- **Service:** the server sleeps `Exp(μ)` seconds per job (single server)
+- **Buffer:** maximum queue length **K** (`MAX_QUEUE_LEN`)
+- **Metrics:** delay distribution, loss, and corruption vs. load (λ relative to μ)
+
+---
+
+## Requirements
+
+- Python 3.9+ recommended
+- Packages:
+  - `numpy`
+  - `matplotlib`
+  - `pyserial`
+
+Install:
+```bash
+pip install numpy matplotlib pyserial
+```
+
+Hardware (if using real radars):
+- 2× TI **IWR1642BOOST** boards (or 1 board if you only run one client)
+- Correct serial ports for each board (CLI + DATA)
+
+---
+
+## Configuration you are expected to edit
+
+### 1) Serial ports per radar
+In `radar1.py` / `radar2.py` update:
+- `CLI_PORT`
+- `DATA_PORT`
+
+Example (Windows):
+```python
+CLI_PORT = "COM13"
+DATA_PORT = "COM14"
+```
+
+Example (Linux):
+```python
+CLI_PORT = "/dev/ttyACM0"
+DATA_PORT = "/dev/ttyACM1"
+```
+
+### 2) Pick the correct config file per radar
+Each radar script sends `CONFIG_FILE` over the CLI port.
+
+- `radar2.py` is already set to `IWR1642_R2_SDK3_config.cfg`
+- **Check `radar1.py`**: it currently also points to `IWR1642_R2_SDK3_config.cfg`.  
+  If you want different configs per radar, change `radar1.py` to:
+```python
+CONFIG_FILE = "IWR1642_R1_SDK3_config.cfg"
+```
+
+### 3) Traffic + server capacity parameters
+**Radar side** (per client):
+- `arrival_rate` (λ, packets/second)
+- `RUN_DURATION` (seconds)
+
+**Server side**:
+- `SERVICE_RATE` (μ, jobs/second)
+- `MAX_QUEUE_LEN` (K)
+- `upper_threshold` (seconds; delay above this is counted “corrupted”)
+
+---
+
+## Run instructions
+
+### Windows (recommended if your COM ports are Windows-style)
+1. Open a terminal and start the server:
+   ```bat
+   python server.py
+   ```
+2. In two other terminals, start the radar clients:
+   ```bat
+   python radar1.py
+   python radar2.py
+   ```
+Or run everything at once:
+```bat
+run_all.bat
+```
+
+### Linux / macOS
+Start in three terminals:
+```bash
+python3 server.py
+python3 radar1.py
+python3 radar2.py
+```
+
+> The provided `makefile` is currently out of sync with the filenames in this repo.  
+> You can still run the commands above directly.
+
+---
+
+## Outputs
+
+When all clients disconnect, the server prints a final summary (OK / corrupted / lost per radar) and saves:
+- `delay_histogram_R1.png`
+- `delay_histogram_R2.png`  
+(in the folder where you ran `server.py`)
+
+---
+
+## Troubleshooting
+
+- **`serial.serialutil.SerialException` (port not found / access denied)**  
+  Confirm the correct CLI/DATA ports and close any other serial monitors.
+- **Nothing is parsed / x,y stays (0.0, 0.0)**  
+  The TLV parser expects **TLV type 1** detected points. Ensure your mmWave config enables detected points output.
+- **Server shows lots of DROPPED packets**  
+  Increase `MAX_QUEUE_LEN`, decrease `arrival_rate`, or increase `SERVICE_RATE`.
+- **Histograms not saved**  
+  Ensure the server process has permission to write files to the current directory.
+
+---
+
+## What to try next
+
+- Sweep `arrival_rate` across a range and plot **loss vs. load** and **corruption vs. load**
+- Extend the payload to include more detections or velocities
+- Replace the “delay > threshold” corruption rule with application-specific QoS constraints
